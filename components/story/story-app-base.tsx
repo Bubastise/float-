@@ -59,6 +59,9 @@ import {
   type StoryMessage,
   type StorySession,
   updateStorySession,
+  updateStorySessionCharacters,
+  resolveStorySessionCharacterIds,
+  storyCharacterSelectionKey,
 } from "@/lib/story-storage";
 import { SessionCustomCSS } from "@/components/ui/session-custom-css";
 import { STORY_CSS_EXAMPLE } from "@/lib/css-examples";
@@ -274,7 +277,9 @@ export function StoryApp({ onClose }: StoryAppProps) {
   const [ready, setReady] = useState(false);
   const [, setStorageVersion] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [activeCharacterId, setActiveCharacterId] = useState<string>("");
+  // 多角色剧情：本段剧情挂载的角色阵容；首项为主角色（决定 API 绑定/预设/记忆）
+  const [activeCharacterIds, setActiveCharacterIds] = useState<string[]>([]);
+  const activeCharacterId = activeCharacterIds[0] || "";
   const [activeSessionId, setActiveSessionId] = useState<string>("");
   const [messages, setMessages] = useState<StoryMessage[]>([]);
   const [visibleMessageCount, setVisibleMessageCount] = useState(STORY_INITIAL_LOAD);
@@ -314,6 +319,22 @@ export function StoryApp({ onClose }: StoryAppProps) {
     () => characters.find((character) => character.id === activeCharacterId) || null,
     [characters, activeCharacterId]
   );
+  // 整场剧情的角色阵容（顺序即选择顺序，首项为主角色）
+  const castCharacters = useMemo(
+    () => activeCharacterIds
+      .map((id) => characters.find((character) => character.id === id))
+      .filter((character): character is NonNullable<typeof character> => Boolean(character)),
+    [characters, activeCharacterIds]
+  );
+  const castNames = useMemo(
+    () => (castCharacters.length > 0 ? castCharacters.map((character) => character.name).join("、") : ""),
+    [castCharacters]
+  );
+  // 阵容签名（与顺序无关）：用来判断会话是否属于同一段剧情
+  const activeSelectionKey = useMemo(
+    () => storyCharacterSelectionKey(activeCharacterIds),
+    [activeCharacterIds]
+  );
   const sessions = loadStorySessions();
   const currentSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionId) || null,
@@ -343,10 +364,10 @@ export function StoryApp({ onClose }: StoryAppProps) {
 
   useEffect(() => {
     hydrateStoryStorage().then(() => {
-      const initialChar = loadCharacters()[0]?.id || "";
-      if (initialChar) {
-        const session = createOrGetStorySession(initialChar);
-        setActiveCharacterId(initialChar);
+      const initialCast = loadCharacters().slice(0, 1).map((character) => character.id);
+      if (initialCast.length > 0) {
+        const session = createOrGetStorySession(initialCast);
+        setActiveCharacterIds(initialCast);
         setActiveSessionId(session.id);
         activeSessionIdRef.current = session.id; // 同步更新，堵住生成完成回调的守卫空窗
         setVisibleMessageCount(STORY_INITIAL_LOAD);
@@ -360,9 +381,10 @@ export function StoryApp({ onClose }: StoryAppProps) {
     });
   }, []);
 
+  // 阵容变化时切到对应剧情会话；同一组角色（顺序无关）始终落在同一段剧情里
   useEffect(() => {
-    if (!activeCharacterId) return;
-    const session = createOrGetStorySession(activeCharacterId);
+    if (activeCharacterIds.length === 0) return;
+    const session = createOrGetStorySession(activeCharacterIds);
     setActiveSessionId(session.id);
     activeSessionIdRef.current = session.id; // 同步更新，堵住生成完成回调的守卫空窗
     setVisibleMessageCount(STORY_INITIAL_LOAD);
@@ -371,7 +393,9 @@ export function StoryApp({ onClose }: StoryAppProps) {
     setFoldTagsDraft(session.foldTags ?? "think,thinking");
     setContextExcludedTagsDraft(session.contextExcludedTags ?? "think,thinking");
     setStorageVersion((value) => value + 1);
-  }, [activeCharacterId]);
+    // 依赖用阵容签名而不是数组对象：数组每次渲染都是新引用
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSelectionKey]);
 
   // Listen for live CSS updates from 小卷
   useEffect(() => {
@@ -536,7 +560,8 @@ export function StoryApp({ onClose }: StoryAppProps) {
     // 抛出去会让整个剧情页白屏，所以失败时跳过缓存刷新，错误留到发送时提示
     let signature: { regexSignature: string; parserVersion: number };
     try {
-      signature = getStoryRenderSignature(activeCharacterId);
+      // 用会话自己的阵容算签名：多角色剧情里主角色可能与组件状态短暂不同步
+      signature = getStoryRenderSignature(resolveStorySessionCharacterIds(currentSession));
     } catch {
       return;
     }
@@ -560,7 +585,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
       if (cancelled) return;
       let rebuilt: StoryMessage[];
       try {
-        rebuilt = rebuildStorySessionRenderCache(activeCharacterId, currentSession.id, { sessionFoldTags: currentSession.foldTags });
+        rebuilt = rebuildStorySessionRenderCache(resolveStorySessionCharacterIds(currentSession), currentSession.id, { sessionFoldTags: currentSession.foldTags });
       } catch {
         if (cacheRefreshKeyRef.current === refreshKey) cacheRefreshKeyRef.current = null;
         return;
@@ -598,6 +623,39 @@ export function StoryApp({ onClose }: StoryAppProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, activeCharacterId, currentSession?.id, currentSession?.foldTags, messages, isGenerating]);
 
+  /** 增删本段剧情的角色：能选中多个，历史消息不受影响 */
+  function toggleStoryCastMember(memberId: string) {
+    const current = activeCharacterIds;
+    const next = current.includes(memberId)
+      ? current.filter((id) => id !== memberId)
+      : [...current, memberId];
+    if (next.length === 0) return; // 至少保留一个角色
+
+    // 已有同组角色的剧本 → 直接切过去，避免两段同阵容剧本互相覆盖
+    const nextKey = storyCharacterSelectionKey(next);
+    const existing = loadStorySessions().find(
+      (session) => storyCharacterSelectionKey(resolveStorySessionCharacterIds(session)) === nextKey
+    );
+    if (existing && existing.id !== activeSessionId) {
+      // 同组角色但顺序变了 = 换了主角色，顺手把会话的主角色一起更新
+      if (existing.characterId !== next[0]) {
+        updateStorySessionCharacters(existing.id, next);
+      }
+      setActiveCharacterIds(next);
+      setActiveSessionId(existing.id);
+      setStorageVersion((value) => value + 1);
+      return;
+    }
+
+    // 否则就地改写当前剧本阵容：换角色不换剧情，已写的内容保留
+    if (currentSession) {
+      const updated = updateStorySessionCharacters(currentSession.id, next);
+      if (!updated) return;
+    }
+    setActiveCharacterIds(next);
+    setStorageVersion((value) => value + 1);
+  }
+
   function applySessionUpdates(updates: Partial<StorySession>) {
     if (!currentSession) return;
     const next = updateStorySession(currentSession.id, updates);
@@ -612,7 +670,12 @@ export function StoryApp({ onClose }: StoryAppProps) {
     const userText = userTextInput.trim();
     if (!activeSessionId || !userText || isGenerating) return;
     const sessionId = activeSessionId;
-    const characterId = activeCharacterId;
+    // 阵容以会话为准（切换会话时 state 可能还没同步）；首项为主角色，
+    // 记忆、API 绑定与摘要都挂在它身上
+    const castIds = currentSession
+      ? resolveStorySessionCharacterIds(currentSession)
+      : (activeCharacterIds.length > 0 ? activeCharacterIds : [activeCharacterId]);
+    const characterId = castIds[0] || activeCharacterId;
 
     const userMessage = pushStoryMessage({
       sessionId,
@@ -629,7 +692,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
 
     try {
       const historyForGeneration = loadStoryMessages(sessionId);
-      const result = await generateStoryCompletion(characterId, historyForGeneration, {
+      const result = await generateStoryCompletion(castIds, historyForGeneration, {
         sessionFoldTags: currentSession?.foldTags,
         sessionContextExcludedTags: currentSession?.contextExcludedTags,
         signal: generationRun.controller.signal,
@@ -780,7 +843,9 @@ export function StoryApp({ onClose }: StoryAppProps) {
     let newRawContent = draft.trim();
     // Apply runOnEdit regex rules (placement=2, isEdit=true) to the edited content.
     try {
-      const { regexes } = getStoryRenderSignature(activeCharacterId);
+      const { regexes } = getStoryRenderSignature(
+        currentSession ? resolveStorySessionCharacterIds(currentSession) : [activeCharacterId]
+      );
       if (regexes.length > 0) {
         const macroEngine = new MacroEngine(currentCharacter?.name ?? "", userIdentity?.name ?? "用户");
         newRawContent = applyEditOutputRegex(newRawContent, regexes, { macroEngine, activeTags: ["story"] });
@@ -816,7 +881,9 @@ export function StoryApp({ onClose }: StoryAppProps) {
     const retryMessage = messages[msgIndex];
     if (retryMessage.role !== "assistant" && retryMessage.role !== "user") return;
     const sessionId = activeSessionId;
-    const characterId = activeCharacterId;
+    const castIds = currentSession
+      ? resolveStorySessionCharacterIds(currentSession)
+      : (activeCharacterIds.length > 0 ? activeCharacterIds : [activeCharacterId]);
     const contextMessages = retryMessage.role === "user"
       ? messages.slice(0, msgIndex + 1)
       : messages.slice(0, msgIndex);
@@ -836,7 +903,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
     const generationRunId = generationRun.runId;
     const isCurrentGeneration = () => mountedRef.current && isStoryGenerationRunActive(sessionId, generationRunId);
     try {
-      const result = await generateStoryCompletion(characterId, contextMessages, {
+      const result = await generateStoryCompletion(castIds, contextMessages, {
         sessionFoldTags: currentSession?.foldTags,
         sessionContextExcludedTags: currentSession?.contextExcludedTags,
         signal: generationRun.controller.signal,
@@ -927,21 +994,40 @@ export function StoryApp({ onClose }: StoryAppProps) {
       <aside className="story-drawer" style={{ transform: drawerOpen ? "translateX(0)" : "translateX(106%)", transition: "transform 220ms ease" }}>
         <div className="story-drawer-section">
           <div className="story-drawer-eyebrow">剧情角色</div>
+          <div style={{ fontSize: "calc(11px*var(--app-text-scale,1))", color: "var(--c-story-sub, rgba(95, 82, 61, 0.72))", marginBottom: 8, lineHeight: 1.5 }}>
+            可多选，选中的角色会一起走这一份剧情。第一个是主角，决定 API 绑定与记忆归属。
+          </div>
           <div className="story-character-list">
-            {characters.map((character) => (
-              <button
-                key={character.id}
-                className="story-character-chip"
-                data-active={character.id === activeCharacterId ? "true" : undefined}
-                onClick={() => {
-                  setActiveCharacterId(character.id);
-                  setDrawerOpen(false);
-                }}
-              >
-                <Avatar src={character.avatar || undefined} name={character.name} size="lg" />
-                <span className="story-character-name">{character.name}</span>
-              </button>
-            ))}
+            {characters.map((character) => {
+              const castIndex = activeCharacterIds.indexOf(character.id);
+              const isCast = castIndex >= 0;
+              return (
+                <button
+                  key={character.id}
+                  className="story-character-chip"
+                  data-active={isCast ? "true" : undefined}
+                  onClick={() => toggleStoryCastMember(character.id)}
+                >
+                  <Avatar src={character.avatar || undefined} name={character.name} size="lg" />
+                  <span className="story-character-name" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                    <span>{character.name}</span>
+                    {isCast && activeCharacterIds.length > 1 ? (
+                      <span style={{
+                        fontSize: "calc(10px*var(--app-text-scale,1))",
+                        lineHeight: 1.4,
+                        padding: "1px 5px",
+                        borderRadius: 999,
+                        border: "1px solid currentColor",
+                        opacity: 0.6,
+                        whiteSpace: "nowrap",
+                      }}>
+                        {castIndex === 0 ? "主角" : `#${castIndex + 1}`}
+                      </span>
+                    ) : null}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -1001,7 +1087,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
             className="story-tool-btn"
             onClick={() => {
               try {
-                const rebuilt = rebuildStorySessionRenderCache(activeCharacterId, currentSession.id, { sessionFoldTags: currentSession.foldTags });
+                const rebuilt = rebuildStorySessionRenderCache(resolveStorySessionCharacterIds(currentSession), currentSession.id, { sessionFoldTags: currentSession.foldTags });
                 setMessages(rebuilt);
                 setStorageVersion((value) => value + 1);
                 alert(`缓存重建完成，${rebuilt.length} 条消息已更新`);
@@ -1065,9 +1151,9 @@ export function StoryApp({ onClose }: StoryAppProps) {
                   )}
                 </div>
                 <div className="story-meta-body">
-                  <div className="story-meta-title">本次阅读：《 {currentCharacter.name} 》</div>
+                  <div className="story-meta-title">本次阅读：《 {castNames || currentCharacter.name} 》</div>
                   <div className="story-meta-tags">
-                    {userIdentity?.name || "我"} x {currentCharacter.name}
+                    {userIdentity?.name || "我"} x {castNames || currentCharacter.name}
                   </div>
                   <div className="story-meta-desc">
                     {/* Character type might not have description, so we use a stylized default text */}
@@ -1201,7 +1287,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
             )}
             {isGenerating ? (
               <StoryGeneratingIndicator
-                characterName={currentCharacter.name}
+                characterName={castNames || currentCharacter.name}
                 avatar={currentCharacter.avatar || undefined}
               />
             ) : null}
@@ -1210,7 +1296,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
       </div>
 
       <StoryComposer
-        characterName={currentCharacter.name}
+        characterName={castNames || currentCharacter.name}
         isGenerating={isGenerating}
         appendRequest={composerAppendRequest}
         onSend={(text) => { void handleSend(text); }}

@@ -11,6 +11,8 @@ export type StoryUiPrefs = {
 export type StorySession = {
   id: string;
   characterId: string;
+  /** 多角色剧情：本段剧情同时挂载的角色；characterId 恒为首项（主角色，决定 API/预设/记忆归属） */
+  characterIds?: string[];
   title?: string;
   updatedAt: string;
   customCSS?: string;
@@ -87,24 +89,55 @@ function isPreferredStorySession(candidate: StorySession, current: StorySession)
   return candidate.id.localeCompare(current.id) > 0;
 }
 
+/** 多角色剧情：把角色选择归一化成去重后的 id 数组（首项 = 主角色） */
+export function normalizeStoryCharacterIds(input: string | string[] | null | undefined): string[] {
+  const raw = Array.isArray(input) ? input : input ? [input] : [];
+  const ids: string[] = [];
+  for (const value of raw) {
+    const id = typeof value === "string" ? value.trim() : "";
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+/** 会话挂载的角色集合（兼容只有 characterId 的存量会话） */
+export function resolveStorySessionCharacterIds(
+  session: Pick<StorySession, "characterId" | "characterIds">
+): string[] {
+  const stored = normalizeStoryCharacterIds(session.characterIds);
+  return stored.length > 0 ? stored : normalizeStoryCharacterIds(session.characterId);
+}
+
+/** 角色集合签名：与顺序无关，用来判断两个会话是不是"同一段剧情" */
+export function storyCharacterSelectionKey(input: string | string[]): string {
+  return normalizeStoryCharacterIds(input).sort().join("|");
+}
+
 function normalizeStorySessions(sessions: StorySession[]): { items: StorySession[]; changed: boolean } {
   const normalized: StorySession[] = [];
-  const indexByCharacter = new Map<string, number>();
+  const indexBySelection = new Map<string, number>();
   let changed = false;
 
   for (const session of sessions) {
     const id = session.id?.trim();
-    const characterId = session.characterId?.trim();
-    if (!id || !characterId) {
+    const characterIds = resolveStorySessionCharacterIds(session);
+    if (!id || characterIds.length === 0) {
       changed = true;
       continue;
     }
-    const item = id === session.id && characterId === session.characterId
-      ? session
-      : { ...session, id, characterId };
-    const existingIndex = indexByCharacter.get(characterId);
+    const primaryId = characterIds[0];
+    // 单角色会话不落 characterIds 字段，存量数据保持原样（零迁移噪音）
+    const storedIds = characterIds.length > 1 ? characterIds : undefined;
+    const idsDiffer = (session.characterIds?.length ?? 0) !== (storedIds?.length ?? 0)
+      || (storedIds ? storedIds.some((value, index) => session.characterIds?.[index] !== value) : false);
+    const item = id !== session.id || primaryId !== session.characterId || idsDiffer
+      ? { ...session, id, characterId: primaryId, characterIds: storedIds }
+      : session;
+
+    const selectionKey = storyCharacterSelectionKey(characterIds);
+    const existingIndex = indexBySelection.get(selectionKey);
     if (existingIndex === undefined) {
-      indexByCharacter.set(characterId, normalized.length);
+      indexBySelection.set(selectionKey, normalized.length);
       normalized.push(item);
       if (item !== session) changed = true;
       continue;
@@ -152,18 +185,27 @@ export function loadStoryMessages(sessionId: string): StoryMessage[] {
     .sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt || ""));
 }
 
-export function createOrGetStorySession(characterId: string): StorySession {
+export function createOrGetStorySession(characterIdsInput: string | string[]): StorySession {
   const normalized = normalizeStorySessions(_sessionsCache);
   if (normalized.changed) {
     _sessionsCache = normalized.items;
     persistStorySessionsSnapshot(normalized.items);
   }
-  const existing = _sessionsCache.find((session) => session.characterId === characterId);
+  const characterIds = normalizeStoryCharacterIds(characterIdsInput);
+  if (characterIds.length === 0) {
+    throw new Error("createOrGetStorySession: characterIds is empty");
+  }
+  const selectionKey = storyCharacterSelectionKey(characterIds);
+  const existing = _sessionsCache.find((session) => (
+    storyCharacterSelectionKey(resolveStorySessionCharacterIds(session)) === selectionKey
+  ));
   if (existing) return existing;
 
   const session: StorySession = {
     id: generateId("story_sess"),
-    characterId,
+    characterId: characterIds[0],
+    // 只有多角色剧情才落 characterIds，单角色会话与旧数据保持一致
+    ...(characterIds.length > 1 ? { characterIds: [...characterIds] } : {}),
     updatedAt: new Date().toISOString(),
     uiPrefs: {},
   };
@@ -184,6 +226,22 @@ export function updateStorySession(sessionId: string, updates: Partial<StorySess
   _sessionsCache[idx] = next;
   storyDb.sessions.put(next).catch(() => undefined);
   return next;
+}
+
+/**
+ * 就地改写某段剧情的角色阵容（历史消息保留）。
+ * 首项为主角色，决定 API 绑定 / 预设 / 记忆归属。
+ */
+export function updateStorySessionCharacters(
+  sessionId: string,
+  characterIdsInput: string | string[]
+): StorySession | null {
+  const characterIds = normalizeStoryCharacterIds(characterIdsInput);
+  if (characterIds.length === 0) return null;
+  return updateStorySession(sessionId, {
+    characterId: characterIds[0],
+    characterIds: characterIds.length > 1 ? characterIds : undefined,
+  });
 }
 
 export function pushStoryMessage(
@@ -262,8 +320,13 @@ export function loadStoryProjectionEntries(
   characterId: string,
   options?: { afterTimestamp?: string; userName?: string; charName?: string }
 ): StoryProjectionEntry[] {
-  const session = _sessionsCache.find((item) => item.characterId === characterId);
-  if (!session) return [];
+  // 同一角色可能同时存在于多段剧情里（单角色剧本 + 多角色共演剧本）。
+  // 优先取"只挂了这个角色"的那段，没有则取包含该角色且最近活跃的那段。
+  const candidates = _sessionsCache.filter((item) => resolveStorySessionCharacterIds(item).includes(characterId));
+  if (candidates.length === 0) return [];
+  const soloSession = candidates.find((item) => resolveStorySessionCharacterIds(item).length === 1);
+  const session = soloSession
+    ?? candidates.reduce((latest, item) => (isPreferredStorySession(item, latest) ? item : latest), candidates[0]);
   const messages = loadStoryMessages(session.id);
   const projections: StoryProjectionEntry[] = [];
 

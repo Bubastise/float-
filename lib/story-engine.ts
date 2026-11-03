@@ -19,12 +19,66 @@ import { buildCalendarScheduleMarker, getCurrentCalendarScheduleForPrompt } from
 import { getWeekStartIso } from "./calendar-utils";
 import { parseStoryResponse } from "./story-parser";
 import { STORY_PARSER_VERSION } from "./story-parser";
-import { loadStoryMessages, replaceStoryMessages, type StoryMessage } from "./story-storage";
+import {
+  loadStoryMessages,
+  normalizeStoryCharacterIds,
+  replaceStoryMessages,
+  type StoryMessage,
+} from "./story-storage";
+import type { Character } from "./character-types";
 import type { ChatMessage } from "./chat-storage";
 import { MacroEngine } from "./macro-engine";
 
 const DEFAULT_STORY_FOLD_TAGS = "think,thinking,summary";
 const DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS = "think,thinking";
+
+/** 解析本段剧情挂载的角色（首项 = 主角色）；有角色卡缺失时直接抛错 */
+function loadStoryCast(characterIdsInput: string | string[]): Character[] {
+  const ids = normalizeStoryCharacterIds(characterIdsInput);
+  if (ids.length === 0) {
+    throw new ChatEngineError("No character selected for this story session.");
+  }
+  const all = loadCharacters();
+  const cast: Character[] = [];
+  for (const id of ids) {
+    const character = all.find((item) => item.id === id);
+    if (!character) {
+      throw new ChatEngineError(`Character not found: ${id}`);
+    }
+    cast.push(character);
+  }
+  return cast;
+}
+
+/** 多角色共演时注入给模型的说明块；单角色剧情不产生任何内容 */
+function buildStoryCastBlock(cast: Character[]): string {
+  if (cast.length <= 1) return "";
+  const [primary, ...others] = cast;
+  const lines: string[] = [
+    `【同场角色】本段剧情由多张角色卡共同出演。除主角色「${primary.name}」外，下面这些角色同样在场，同样由你来扮演：`,
+  ];
+  for (const member of others) {
+    const personality = member.personality?.trim();
+    lines.push(
+      `\n■ ${member.name}${personality ? `（性格：${personality}）` : ""}\n${member.persona?.trim() || "（该角色暂无详细设定，按名字与性格把握）"}`
+    );
+  }
+  const speakerExample = others[0]?.name ?? "角色";
+  lines.push(
+    `\n【共演规则】\n1. 所有角色都在同一条剧情线里，一起推进同一个场景，不要拆成各自独立的故事；\n2. 每个角色的言行必须符合各自人设，不得混用口吻、性格或称呼；\n3. 角色说话时用「名字：」标注说话人，例如 ${speakerExample}：……；旁白、动作与场景描写用普通叙述，不加名字前缀；\n4. 角色之间可以直接对话、互动、各自行动，但都要服务于当前情节；\n5. 不要在正文里复述或解释以上规则。`
+  );
+  return lines.join("\n");
+}
+
+/** 把共演说明插进系统提示区（第一条 system 之后），单角色时原样返回 */
+function injectStoryCastBlock(messages: LLMMessage[], cast: Character[]): LLMMessage[] {
+  const block = buildStoryCastBlock(cast);
+  if (!block) return messages;
+  const inserted: LLMMessage = { role: "system", content: block };
+  const systemIndex = messages.findIndex((message) => message.role === "system");
+  if (systemIndex === -1) return [inserted, ...messages];
+  return [...messages.slice(0, systemIndex + 1), inserted, ...messages.slice(systemIndex + 1)];
+}
 
 export type StoryGenerationResult = {
   rawText: string;
@@ -68,7 +122,7 @@ function toHistoryMessage(message: StoryMessage, contextExcludedTags?: string): 
   };
 }
 
-function resolveStoryConfigs(characterId: string): {
+function resolveStoryConfigs(characterIdsInput: string | string[]): {
   apiConfig: ApiConfig;
   preset: PresetConfig | null;
   regexes: RegexConfig[];
@@ -76,13 +130,12 @@ function resolveStoryConfigs(characterId: string): {
   regexSignature: string;
   summaryTag: string;
 } {
-  const character = loadCharacters().find((item) => item.id === characterId);
-  if (!character) {
-    throw new ChatEngineError(`Character not found: ${characterId}`);
-  }
+  const cast = loadStoryCast(characterIdsInput);
+  // 主角色（首项）决定 API 绑定、预设与正则；其余角色只贡献人设与世界书
+  const character = cast[0];
 
   const bindings = loadBindingConfig();
-  const activeSlot = resolveBinding(bindings, characterId, "story");
+  const activeSlot = resolveBinding(bindings, character.id, "story");
   if (!activeSlot.apiConfigId) {
     throw new ChatEngineError(`No API Configuration bound for ${character.name}. Please go to Settings -> 绑定管理 -> 剧情 to assign one.`);
   }
@@ -99,7 +152,7 @@ function resolveStoryConfigs(characterId: string): {
   }
 
   const allRegexes = loadRegexes();
-  const charBinding = bindings.characterBindings.find((item) => item.characterId === characterId);
+  const charBinding = bindings.characterBindings.find((item) => item.characterId === character.id);
   const storyOverrideRegexIds = charBinding?.appOverrides.story?.regexIds;
   const regexIds = storyOverrideRegexIds && storyOverrideRegexIds.length > 0
     ? storyOverrideRegexIds
@@ -109,7 +162,17 @@ function resolveStoryConfigs(characterId: string): {
     .filter(Boolean) as RegexConfig[];
 
   const allWorldBooks = loadWorldBooks();
-  const worldBooks = (activeSlot.worldBookIds || [])
+  // 世界书取整场剧情的并集：主角色用自己「剧情」绑定的世界书，其余同场角色各取自己的
+  const worldBookIds: string[] = [];
+  for (const member of cast) {
+    // 配角可能没配「剧情」绑定，取不到就跳过，不能让它拖垮整次生成
+    const slot = member.id === character.id ? activeSlot : resolveBinding(bindings, member.id, "story");
+    const slotWorldBookIds = slot ? slot.worldBookIds || [] : [];
+    for (const id of slotWorldBookIds) {
+      if (!worldBookIds.includes(id)) worldBookIds.push(id);
+    }
+  }
+  const worldBooks = worldBookIds
     .map((id) => allWorldBooks.find((worldBook) => worldBook.id === id))
     .filter(Boolean) as WorldBookConfig[];
   const summaryTag = preset?.story_summary_tag?.trim() || "summary";
@@ -124,8 +187,8 @@ function resolveStoryConfigs(characterId: string): {
   };
 }
 
-export function getStoryRenderSignature(characterId: string): { regexSignature: string; parserVersion: number; regexes: RegexConfig[] } {
-  const { regexSignature, regexes } = resolveStoryConfigs(characterId);
+export function getStoryRenderSignature(characterIds: string | string[]): { regexSignature: string; parserVersion: number; regexes: RegexConfig[] } {
+  const { regexSignature, regexes } = resolveStoryConfigs(characterIds);
   return {
     regexSignature,
     parserVersion: STORY_PARSER_VERSION,
@@ -134,21 +197,19 @@ export function getStoryRenderSignature(characterId: string): { regexSignature: 
 }
 
 export async function generateStoryCompletion(
-  characterId: string,
+  characterIds: string | string[],
   history: StoryMessage[],
   options?: { sessionFoldTags?: string; sessionContextExcludedTags?: string; signal?: AbortSignal },
 ): Promise<StoryGenerationResult> {
-  const character = loadCharacters().find((item) => item.id === characterId);
-  if (!character) {
-    throw new ChatEngineError(`Character not found: ${characterId}`);
-  }
+  const cast = loadStoryCast(characterIds);
+  const character = cast[0];
 
-  const { apiConfig, preset, regexes, worldBooks, regexSignature, summaryTag } = resolveStoryConfigs(characterId);
+  const { apiConfig, preset, regexes, worldBooks, regexSignature, summaryTag } = resolveStoryConfigs(cast.map((item) => item.id));
   const effectiveFoldTags = options?.sessionFoldTags?.trim() || DEFAULT_STORY_FOLD_TAGS;
   const effectiveContextExcludedTags = options?.sessionContextExcludedTags?.trim() || DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS;
-  const llmMessages = await buildStoryPromptMessages(characterId, history, preset, regexes, worldBooks, effectiveContextExcludedTags);
+  const llmMessages = await buildStoryPromptMessages(cast, history, preset, regexes, worldBooks, effectiveContextExcludedTags);
 
-  const userIdentity = resolveUserIdentity(characterId, "story");
+  const userIdentity = resolveUserIdentity(character.id, "story");
   const macroEngine = new MacroEngine(character.name, userIdentity?.name ?? "用户");
 
   const rawOutput = await sendLLMRequest(apiConfig, preset, llmMessages, regexes, {
@@ -174,34 +235,42 @@ export async function generateStoryCompletion(
 }
 
 async function buildStoryPromptMessages(
-  characterId: string,
+  cast: Character[],
   history: StoryMessage[],
   preset: PresetConfig | null,
   regexes: RegexConfig[],
   worldBooks: WorldBookConfig[],
   contextExcludedTags: string = DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS,
 ): Promise<LLMMessage[]> {
-  const character = loadCharacters().find((item) => item.id === characterId);
+  const character = cast[0];
   if (!character) {
-    throw new ChatEngineError(`Character not found: ${characterId}`);
+    throw new ChatEngineError("No character selected for this story session.");
   }
 
-  const userIdentity = resolveUserIdentity(characterId, "story");
+  const userIdentity = resolveUserIdentity(character.id, "story");
   const historyMessages = history.map((message) => toHistoryMessage(message, contextExcludedTags));
   const memConfig = loadMemoryConfig();
-  const { recentBlocks, truncatedHistory, wbActivationContext, unifiedRecentItems } = prepareShortTermContext(characterId, "story", {
+  // 多角色共用一条剧情线：短期上下文与长期记忆都挂在主角色身上，
+  // 同场角色的人设随共演说明块注入，不额外拆记忆库
+  const { recentBlocks, truncatedHistory, wbActivationContext, unifiedRecentItems } = prepareShortTermContext(character.id, "story", {
     userName: userIdentity?.name ?? "用户",
     history: historyMessages,
   });
 
+  // 把同场角色名字并入世界书激活上下文：挂在配角身上的关键词条目也能触发
+  const castActivationContext = [
+    wbActivationContext,
+    cast.length > 1 ? cast.map((member) => member.name).join(" ") : "",
+  ].filter(Boolean).join("\n");
+
   const [memories, coreMemories] = await Promise.all([
-    retrieveMemoriesForPrompt(characterId, wbActivationContext, memConfig).catch(() => null),
-    retrieveCoreMemoriesForPrompt(characterId, memConfig).catch(() => null),
+    retrieveMemoriesForPrompt(character.id, castActivationContext, memConfig).catch(() => null),
+    retrieveCoreMemoriesForPrompt(character.id, memConfig).catch(() => null),
   ]);
 
   const now = new Date();
 
-  return assemblePromptPayload({
+  const messages = assemblePromptPayload({
     character,
     history: truncatedHistory,
     preset,
@@ -209,43 +278,43 @@ async function buildStoryPromptMessages(
     regexes,
     userIdentity,
     appId: "story",
-    scheduleSummary: buildCalendarScheduleMarker("character", characterId, getWeekStartIso(now)),
-    currentSchedule: getCurrentCalendarScheduleForPrompt("character", characterId, now),
+    scheduleSummary: buildCalendarScheduleMarker("character", character.id, getWeekStartIso(now)),
+    currentSchedule: getCurrentCalendarScheduleForPrompt("character", character.id, now),
     coreMemories: coreMemories ? formatCoreMemories(coreMemories) : "",
     longTermMemories: memories ? formatLongTermMemories(memories) : "",
-    worldBookActivationContext: wbActivationContext,
+    worldBookActivationContext: castActivationContext,
     recentBlocks,
     unifiedRecentItems,
   });
+
+  return injectStoryCastBlock(messages, cast);
 }
 
 export async function previewStoryPromptPayload(
-  characterId: string,
+  characterIds: string | string[],
   history: StoryMessage[],
   options?: { sessionContextExcludedTags?: string },
 ): Promise<StoryPreviewResult> {
-  const character = loadCharacters().find((item) => item.id === characterId);
-  if (!character) {
-    throw new ChatEngineError(`Character not found: ${characterId}`);
-  }
-  const { apiConfig, preset, regexes, worldBooks } = resolveStoryConfigs(characterId);
+  const cast = loadStoryCast(characterIds);
+  const { apiConfig, preset, regexes, worldBooks } = resolveStoryConfigs(cast.map((item) => item.id));
   const effectiveContextExcludedTags = options?.sessionContextExcludedTags?.trim() || DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS;
-  const llmMessages = await buildStoryPromptMessages(characterId, history, preset, regexes, worldBooks, effectiveContextExcludedTags);
+  const llmMessages = await buildStoryPromptMessages(cast, history, preset, regexes, worldBooks, effectiveContextExcludedTags);
   return {
     messages: previewMessagesForApi(apiConfig, preset, llmMessages),
-    characterName: character.name,
+    characterName: cast.map((item) => item.name).join("、"),
     model: apiConfig.defaultModel,
     presetName: preset?.name || "默认预设",
   };
 }
 
-export function rebuildStorySessionRenderCache(characterId: string, sessionId: string, options?: { sessionFoldTags?: string }): StoryMessage[] {
-  const { regexSignature, parserVersion } = getStoryRenderSignature(characterId);
-  const { regexes, summaryTag } = resolveStoryConfigs(characterId);
+export function rebuildStorySessionRenderCache(characterIds: string | string[], sessionId: string, options?: { sessionFoldTags?: string }): StoryMessage[] {
+  const { regexSignature, parserVersion } = getStoryRenderSignature(characterIds);
+  const { regexes, summaryTag } = resolveStoryConfigs(characterIds);
   const effectiveFoldTags = options?.sessionFoldTags?.trim() || DEFAULT_STORY_FOLD_TAGS;
 
-  const character = loadCharacters().find((c) => c.id === characterId);
-  const userIdentity = resolveUserIdentity(characterId, "story");
+  const primaryCharacterId = normalizeStoryCharacterIds(characterIds)[0] ?? "";
+  const character = loadCharacters().find((c) => c.id === primaryCharacterId);
+  const userIdentity = resolveUserIdentity(primaryCharacterId, "story");
   const macroEngine = new MacroEngine(character?.name ?? "", userIdentity?.name ?? "用户");
 
   const rebuilt = loadStoryMessages(sessionId).map((message) => {
