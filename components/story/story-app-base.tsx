@@ -63,6 +63,7 @@ import {
   resolveStorySessionCharacterIds,
   storyCharacterSelectionKey,
 } from "@/lib/story-storage";
+import { recordStoryCastMemories } from "@/lib/story-cast-memory";
 import { SessionCustomCSS } from "@/components/ui/session-custom-css";
 import { STORY_CSS_EXAMPLE } from "@/lib/css-examples";
 import { applyEditOutputRegex } from "@/lib/llm-prompt-assembler";
@@ -716,9 +717,21 @@ export function StoryApp({ onClose }: StoryAppProps) {
       if (storyCharacter) {
         void (async () => {
           try {
+            // 主角色：沿用原有「事件计数 + 定时总结」管线
             incrementEventCounter(characterId);
             incrementEventCounter(characterId);
             await maybeRunSummarization(characterId, storyCharacter.name);
+            // 同场其他角色：把本次剧情摘要直接写入各自长期记忆。
+            // 全部复用这一次剧情生成的输出，不额外发起任何 LLM 调用。
+            if (castIds.length > 1) {
+              await recordStoryCastMemories({
+                characterIds: castIds,
+                primaryCharacterId: characterId,
+                summaryText: result.storySummary,
+                fallbackText: result.renderedText,
+                sessionId,
+              });
+            }
           } catch (err) {
             console.warn("[StoryApp] Memory counter/summarization failed:", err);
           }
