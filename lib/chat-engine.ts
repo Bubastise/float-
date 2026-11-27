@@ -103,6 +103,27 @@ export class ChatEngineError extends Error {
 const LLM_IMAGE_MAX_SIDE = 512;
 const LLM_IMAGE_JPEG_QUALITY = 0.72;
 
+/**
+ * 单次 LLM 请求的超时上限（毫秒）。
+ *
+ * 原先四处硬编码 500 秒：长剧情 / 大上下文一次生成很容易超过 8 分钟，
+ * 被本地 AbortController 掐断后已生成的内容全部丢弃，只报「超时请重试」。
+ * 现放宽到 30 分钟，并支持用环境变量 NEXT_PUBLIC_LLM_TIMEOUT_SECONDS 覆盖
+ * （部署平台加上该变量并重新构建即可，单位为秒）。
+ */
+const DEFAULT_LLM_TIMEOUT_SECONDS = 1800;
+
+export function resolveLlmTimeoutMs(): number {
+    const raw = typeof process !== "undefined" ? process.env.NEXT_PUBLIC_LLM_TIMEOUT_SECONDS : undefined;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.round(parsed * 1000);
+    return DEFAULT_LLM_TIMEOUT_SECONDS * 1000;
+}
+
+export function resolveLlmTimeoutSeconds(): number {
+    return Math.round(resolveLlmTimeoutMs() / 1000);
+}
+
 function blobToDataUrl(blob: Blob): Promise<string> {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -815,7 +836,7 @@ export async function sendLLMStreamRequest(
     const request = buildProviderRequest(config, effectivePreset, requestMessages, { stream: true });
     publishDebugPromptSnapshot({ request, config, preset: effectivePreset, meta, options, requestKind: "completion" });
     const llmAbort = new AbortController();
-    const llmTimeout = setTimeout(() => llmAbort.abort(), 500_000);
+    const llmTimeout = setTimeout(() => llmAbort.abort(), resolveLlmTimeoutMs());
     const detachExternalAbort = attachExternalAbort(llmAbort, options?.signal);
 
     try {
@@ -869,7 +890,7 @@ export async function sendLLMStreamRequest(
     } catch (error: unknown) {
         if (error instanceof DOMException && (error as DOMException).name === "AbortError") {
             if (options?.signal?.aborted) throw error;
-            throw new ChatEngineError("AI 流式回复超时（500秒），请重试。");
+            throw new ChatEngineError(`AI 流式回复超时（${resolveLlmTimeoutSeconds()}秒），请重试。`);
         }
         if (error instanceof ChatEngineError) throw error;
         const detail = error instanceof Error ? error.message : String(error);
@@ -934,7 +955,7 @@ export async function sendLLMRequest(
     console.log("[ChatEngine] Request:", requestDebugInfo);
 
     const llmAbort = new AbortController();
-    const llmTimeout = setTimeout(() => llmAbort.abort(), 500_000);
+    const llmTimeout = setTimeout(() => llmAbort.abort(), resolveLlmTimeoutMs());
     const detachExternalAbort = attachExternalAbort(llmAbort, options?.signal);
 
     try {
@@ -1004,7 +1025,7 @@ export async function sendLLMRequest(
         return applyOutputRegex(rawOutput, regexes, { macroEngine, activeTags });
     } catch (error: unknown) {
         if (error instanceof DOMException && (error as DOMException).name === "AbortError") {
-            throw new ChatEngineError("AI 回复超时（500秒），请重试。");
+            throw new ChatEngineError(`AI 回复超时（${resolveLlmTimeoutSeconds()}秒），请重试。`);
         }
         if (error instanceof ChatEngineError) throw error;
         const detail = error instanceof Error ? error.message : String(error);
@@ -1104,7 +1125,7 @@ export async function sendLLMToolStreamRequest(
     const request = buildProviderRequest(config, effectivePreset, afterPlugins.messages, { tools, stream: true, maxTokens: options?.maxTokens });
     publishDebugPromptSnapshot({ request, config, preset: effectivePreset, meta, options, requestKind: "native-tools-stream", tools });
     const llmAbort = new AbortController();
-    const llmTimeout = setTimeout(() => llmAbort.abort(), 500_000);
+    const llmTimeout = setTimeout(() => llmAbort.abort(), resolveLlmTimeoutMs());
     const detachExternalAbort = attachExternalAbort(llmAbort, options?.signal);
     let rawResponse = "";
     let content = "";
@@ -1224,7 +1245,7 @@ export async function sendLLMToolStreamRequest(
     } catch (error: unknown) {
         if (error instanceof DOMException && error.name === "AbortError") {
             if (options?.signal?.aborted) throw error;
-            throw new ChatEngineError("AI 原生动作流式回复超时（500秒），请重试。");
+            throw new ChatEngineError(`AI 原生动作流式回复超时（${resolveLlmTimeoutSeconds()}秒），请重试。`);
         }
         if (error instanceof ChatEngineError) throw error;
         const detail = error instanceof Error ? error.message : String(error);
@@ -1258,7 +1279,7 @@ export async function sendLLMToolRequest(
     const request = buildProviderRequest(config, effectivePreset, afterPlugins.messages, { tools });
     publishDebugPromptSnapshot({ request, config, preset: effectivePreset, meta, options, requestKind: "native-tools", tools });
     const llmAbort = new AbortController();
-    const llmTimeout = setTimeout(() => llmAbort.abort(), 500_000);
+    const llmTimeout = setTimeout(() => llmAbort.abort(), resolveLlmTimeoutMs());
     const detachExternalAbort = attachExternalAbort(llmAbort, options?.signal);
 
     try {
@@ -1331,7 +1352,7 @@ export async function sendLLMToolRequest(
     } catch (error: unknown) {
         if (error instanceof DOMException && error.name === "AbortError") {
             if (options?.signal?.aborted) throw error;
-            throw new ChatEngineError("AI 原生动作回复超时（500秒），请重试。");
+            throw new ChatEngineError(`AI 原生动作回复超时（${resolveLlmTimeoutSeconds()}秒），请重试。`);
         }
         if (error instanceof ChatEngineError) throw error;
         const detail = error instanceof Error ? error.message : String(error);
