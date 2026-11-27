@@ -10,7 +10,7 @@ import {
 } from "./settings-storage";
 import type { ApiConfig, PresetConfig, RegexConfig, WorldBookConfig } from "./settings-types";
 import { assemblePromptPayload, type LLMMessage } from "./llm-prompt-assembler";
-import { previewMessagesForApi, sendLLMRequest, ChatEngineError } from "./chat-engine";
+import { previewMessagesForApi, sendLLMRequest, sendLLMStreamRequest, ChatEngineError } from "./chat-engine";
 import { loadMemoryConfig } from "./memory-storage";
 import { retrieveCoreMemoriesForPrompt, retrieveMemoriesForPrompt } from "./memory-service";
 import { formatCoreMemories, formatLongTermMemories } from "./memory-injector";
@@ -133,10 +133,55 @@ export function getStoryRenderSignature(characterId: string): { regexSignature: 
   };
 }
 
+/**
+ * 流式剧情生成：边收增量边回调 onDelta（供页面实时显示），结束后返回与非流式入口
+ * 完全同构的原始文本（思维链同样以 <think> 块前置，后续正则/折叠标签处理不变）。
+ */
+async function requestStoryStreamOutput(
+  apiConfig: ApiConfig,
+  preset: PresetConfig | null,
+  messages: LLMMessage[],
+  regexes: RegexConfig[],
+  characterName: string,
+  options: { signal?: AbortSignal; onDelta?: (text: string) => void },
+): Promise<string> {
+  let reasoning = "";
+  try {
+    const streamed = await sendLLMStreamRequest(apiConfig, preset, messages, regexes, {
+      characterName,
+    }, {
+      skipOutputRegex: true,
+      includeReasoning: true,
+      appId: "story",
+      appTags: ["story"],
+      signal: options.signal,
+    }, {
+      onDelta: (delta) => options.onDelta?.(delta),
+      onReasoningDelta: (delta) => { reasoning += delta; },
+    });
+    const content = streamed.content.trim();
+    return reasoning.trim()
+      ? `<think>\n${reasoning.trim()}\n</think>\n\n${content}`
+      : content;
+  } catch (error) {
+    if (error instanceof ChatEngineError && error.message.includes("没有解析到文本增量")) {
+      throw new ChatEngineError("流式响应没有解析到文本增量：当前 API 渠道可能不支持流式输出，请在剧情侧栏关闭「流式输出」后重试。");
+    }
+    throw error;
+  }
+}
+
 export async function generateStoryCompletion(
   characterId: string,
   history: StoryMessage[],
-  options?: { sessionFoldTags?: string; sessionContextExcludedTags?: string; signal?: AbortSignal },
+  options?: {
+    sessionFoldTags?: string;
+    sessionContextExcludedTags?: string;
+    signal?: AbortSignal;
+    /** true = 流式生成（边生成边回调 onDelta）；缺省 = 整段生成后一次返回 */
+    stream?: boolean;
+    onDelta?: (text: string) => void;
+  },
 ): Promise<StoryGenerationResult> {
   const character = loadCharacters().find((item) => item.id === characterId);
   if (!character) {
@@ -151,9 +196,14 @@ export async function generateStoryCompletion(
   const userIdentity = resolveUserIdentity(characterId, "story");
   const macroEngine = new MacroEngine(character.name, userIdentity?.name ?? "用户");
 
-  const rawOutput = await sendLLMRequest(apiConfig, preset, llmMessages, regexes, {
-    characterName: character.name,
-  }, { skipOutputRegex: true, includeReasoning: true, appId: "story", appTags: ["story"], signal: options?.signal });
+  const rawOutput = options?.stream
+    ? await requestStoryStreamOutput(apiConfig, preset, llmMessages, regexes, character.name, {
+        signal: options.signal,
+        onDelta: options.onDelta,
+      })
+    : await sendLLMRequest(apiConfig, preset, llmMessages, regexes, {
+        characterName: character.name,
+      }, { skipOutputRegex: true, includeReasoning: true, appId: "story", appTags: ["story"], signal: options?.signal });
 
   const parsed = parseStoryResponse(rawOutput, regexes, {
     summaryTag,

@@ -152,6 +152,52 @@ const STORY_GENERATION_STATUS = ["整理场景", "续写剧情", "打磨对白",
 const STORY_INITIAL_LOAD = 10;
 const STORY_LOAD_MORE_COUNT = 10;
 
+/**
+ * 流式预览只显示纯文本：思维链（含尚未闭合的 think 块）和 HTML 标签都剥掉，
+ * 避免半截标签随增量乱闪。块级标签换成换行，保留段落感。
+ */
+function streamPreviewText(raw: string): string {
+  return raw
+    .replace(/<think(?:ing)?>[\s\S]*?(<\/think(?:ing)?>|$)/gi, "")
+    .replace(/<\/?(p|div|br|li|h[1-6])\b[^>]*>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^\s+/, "");
+}
+
+function StoryStreamingBubble({
+  characterName,
+  avatar,
+  text,
+}: {
+  characterName: string;
+  avatar?: string;
+  text: string;
+}) {
+  return (
+    <article className="story-row" data-role="assistant">
+      <div className="story-msg-head">
+        <div className="story-avatar-wrap">
+          <Avatar src={avatar || undefined} name={characterName} size="md" />
+        </div>
+        <div className="story-msg-meta">
+          <span className="story-msg-name">{characterName}</span>
+          <span className="story-msg-time story-generating-head">正在书写</span>
+        </div>
+      </div>
+      <div className="story-bubble-wrap">
+        <div className="story-bubble">
+          <div className="story-streaming-text">
+            {streamPreviewText(text) || "…"}
+            <span className="story-streaming-caret" aria-hidden="true" />
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function StoryGeneratingIndicator({
   characterName,
   avatar,
@@ -279,6 +325,8 @@ export function StoryApp({ onClose }: StoryAppProps) {
   const [messages, setMessages] = useState<StoryMessage[]>([]);
   const [visibleMessageCount, setVisibleMessageCount] = useState(STORY_INITIAL_LOAD);
   const [composerAppendRequest, setComposerAppendRequest] = useState<StoryComposerAppendRequest | null>(null);
+  // 流式输出的正文预览（只在流式生成期间有值）
+  const [streamingPreview, setStreamingPreview] = useState("");
   const [customCssDraft, setCustomCssDraft] = useState("");
   const [foldTagsDraft, setFoldTagsDraft] = useState("");
   const [contextExcludedTagsDraft, setContextExcludedTagsDraft] = useState("");
@@ -300,6 +348,10 @@ export function StoryApp({ onClose }: StoryAppProps) {
   const activeSessionIdRef = useRef("");
   const cacheRefreshKeyRef = useRef<string | null>(null);
   const composerAppendIdRef = useRef(0);
+  // 流式增量累积在 ref 里、按 100ms 节流刷进 state：逐 token setState 会让整页
+  // 消息列表跟着重渲染，长会话下肉眼可见地卡。
+  const streamingPreviewRef = useRef("");
+  const streamingPreviewTimerRef = useRef<number | null>(null);
   const loadMoreRestoreRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressTriggeredRef = useRef(false);
@@ -329,6 +381,25 @@ export function StoryApp({ onClose }: StoryAppProps) {
       if (on) next.add(sessionId); else next.delete(sessionId);
       return next;
     });
+  }, []);
+
+  const resetStreamingPreview = useCallback(() => {
+    if (streamingPreviewTimerRef.current != null) {
+      window.clearTimeout(streamingPreviewTimerRef.current);
+      streamingPreviewTimerRef.current = null;
+    }
+    streamingPreviewRef.current = "";
+    setStreamingPreview("");
+  }, []);
+
+  const appendStreamingPreview = useCallback((delta: string) => {
+    if (!delta) return;
+    streamingPreviewRef.current += delta;
+    if (streamingPreviewTimerRef.current != null) return;
+    streamingPreviewTimerRef.current = window.setTimeout(() => {
+      streamingPreviewTimerRef.current = null;
+      setStreamingPreview(streamingPreviewRef.current);
+    }, 100);
   }, []);
 
   useEffect(() => {
@@ -626,6 +697,8 @@ export function StoryApp({ onClose }: StoryAppProps) {
     const generationRun = createStoryGenerationRun(sessionId);
     const generationRunId = generationRun.runId;
     const isCurrentGeneration = () => mountedRef.current && isStoryGenerationRunActive(sessionId, generationRunId);
+    const useStream = currentSession?.streamOutput === true;
+    resetStreamingPreview();
 
     try {
       const historyForGeneration = loadStoryMessages(sessionId);
@@ -633,6 +706,10 @@ export function StoryApp({ onClose }: StoryAppProps) {
         sessionFoldTags: currentSession?.foldTags,
         sessionContextExcludedTags: currentSession?.contextExcludedTags,
         signal: generationRun.controller.signal,
+        stream: useStream,
+        onDelta: useStream
+          ? (delta) => { if (isCurrentGeneration()) appendStreamingPreview(delta); }
+          : undefined,
       });
       if (!isCurrentGeneration()) return;
       const assistantMessage = pushStoryMessage({
@@ -675,6 +752,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
       }
       setStorageVersion((value) => value + 1);
     } finally {
+      resetStreamingPreview();
       if (finishStoryGenerationRun(sessionId, generationRunId)) {
         markGenerating(sessionId, false);
       }
@@ -835,11 +913,17 @@ export function StoryApp({ onClose }: StoryAppProps) {
     const generationRun = createStoryGenerationRun(sessionId);
     const generationRunId = generationRun.runId;
     const isCurrentGeneration = () => mountedRef.current && isStoryGenerationRunActive(sessionId, generationRunId);
+    const useStream = currentSession?.streamOutput === true;
+    resetStreamingPreview();
     try {
       const result = await generateStoryCompletion(characterId, contextMessages, {
         sessionFoldTags: currentSession?.foldTags,
         sessionContextExcludedTags: currentSession?.contextExcludedTags,
         signal: generationRun.controller.signal,
+        stream: useStream,
+        onDelta: useStream
+          ? (delta) => { if (isCurrentGeneration()) appendStreamingPreview(delta); }
+          : undefined,
       });
       if (!isCurrentGeneration()) return;
       const assistantMessage = pushStoryMessage({
@@ -856,6 +940,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
       if (activeSessionIdRef.current === sessionId) setMessages(loadStoryMessages(sessionId));
       setStorageVersion(v => v + 1);
     } finally {
+      resetStreamingPreview();
       if (finishStoryGenerationRun(sessionId, generationRunId)) {
         markGenerating(sessionId, false);
       }
@@ -943,6 +1028,34 @@ export function StoryApp({ onClose }: StoryAppProps) {
               </button>
             ))}
           </div>
+        </div>
+
+        <div className="story-drawer-section">
+          <div className="story-drawer-eyebrow">生成</div>
+          <label
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
+              padding: "10px 0", cursor: "pointer",
+            }}
+          >
+            <span style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <span style={{ fontSize: "calc(13px*var(--app-text-scale,1))", color: "var(--c-story-text, #4b4335)" }}>
+                流式输出
+              </span>
+              <span style={{ fontSize: "calc(11px*var(--app-text-scale,1))", lineHeight: 1.5, color: "var(--c-story-sub, rgba(95, 82, 61, 0.72))" }}>
+                边生成边显示正文；关闭则整段生成完成后一次显示。单次请求上限 20 分钟。
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              checked={currentSession.streamOutput === true}
+              onChange={(event) => applySessionUpdates({ streamOutput: event.target.checked })}
+              style={{
+                width: 18, height: 18, flexShrink: 0, cursor: "pointer",
+                accentColor: "var(--c-story-send-bg-active, #0f172a)",
+              }}
+            />
+          </label>
         </div>
 
         <div className="story-drawer-section">
@@ -1200,10 +1313,18 @@ export function StoryApp({ onClose }: StoryAppProps) {
               </>
             )}
             {isGenerating ? (
-              <StoryGeneratingIndicator
-                characterName={currentCharacter.name}
-                avatar={currentCharacter.avatar || undefined}
-              />
+              streamingPreview ? (
+                <StoryStreamingBubble
+                  characterName={currentCharacter.name}
+                  avatar={currentCharacter.avatar || undefined}
+                  text={streamingPreview}
+                />
+              ) : (
+                <StoryGeneratingIndicator
+                  characterName={currentCharacter.name}
+                  avatar={currentCharacter.avatar || undefined}
+                />
+              )
             ) : null}
           </div>
         </div>

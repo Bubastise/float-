@@ -1024,3 +1024,25 @@
         }
         .story-inline-edit-btn-save { color: var(--c-story-accent, #7c6844); font-weight: 500; }
         .story-inline-edit-btn:disabled { opacity: 0.4; cursor: default; }
+
+        /* === 流式输出预览气泡 === */
+        .story-streaming-text {
+          white-space: pre-wrap;
+          word-break: break-word;
+          font-size: calc(14px*var(--app-text-scale,1));
+          line-height: 1.9;
+          color: var(--c-story-text, #4b4335);
+        }
+        @keyframes story-streaming-caret-blink {
+          0%, 45% { opacity: 1; }
+          55%, 100% { opacity: 0; }
+        }
+        .story-streaming-caret {
+          display: inline-block;
+          width: 0.45em;
+          height: 1em;
+          margin-left: 3px;
+          vertical-align: -0.12em;
+          background: currentColor;
+          animation: story-streaming-caret-blink 1s steps(1, end) infinite;
+        }

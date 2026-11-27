@@ -103,6 +103,11 @@ export class ChatEngineError extends Error {
 const LLM_IMAGE_MAX_SIDE = 512;
 const LLM_IMAGE_JPEG_QUALITY = 0.72;
 
+// 单次 LLM 请求的总时限。原先写死 500 秒：剧情这类一次性长输出（尤其带思维链的模型、
+// 走慢速中转时）经常超过 8 分钟，时限一到前端就 abort，哪怕上游已经把整段写完了，
+// 结果也会被整段丢弃、只留一句"超时请重试"。放宽到 20 分钟。
+export const LLM_REQUEST_TIMEOUT_MS = 20 * 60_000;
+
 function blobToDataUrl(blob: Blob): Promise<string> {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -815,7 +820,7 @@ export async function sendLLMStreamRequest(
     const request = buildProviderRequest(config, effectivePreset, requestMessages, { stream: true });
     publishDebugPromptSnapshot({ request, config, preset: effectivePreset, meta, options, requestKind: "completion" });
     const llmAbort = new AbortController();
-    const llmTimeout = setTimeout(() => llmAbort.abort(), 500_000);
+    const llmTimeout = setTimeout(() => llmAbort.abort(), LLM_REQUEST_TIMEOUT_MS);
     const detachExternalAbort = attachExternalAbort(llmAbort, options?.signal);
 
     try {
@@ -869,7 +874,7 @@ export async function sendLLMStreamRequest(
     } catch (error: unknown) {
         if (error instanceof DOMException && (error as DOMException).name === "AbortError") {
             if (options?.signal?.aborted) throw error;
-            throw new ChatEngineError("AI 流式回复超时（500秒），请重试。");
+            throw new ChatEngineError("AI 流式回复超时（20 分钟），请重试。");
         }
         if (error instanceof ChatEngineError) throw error;
         const detail = error instanceof Error ? error.message : String(error);
@@ -934,7 +939,7 @@ export async function sendLLMRequest(
     console.log("[ChatEngine] Request:", requestDebugInfo);
 
     const llmAbort = new AbortController();
-    const llmTimeout = setTimeout(() => llmAbort.abort(), 500_000);
+    const llmTimeout = setTimeout(() => llmAbort.abort(), LLM_REQUEST_TIMEOUT_MS);
     const detachExternalAbort = attachExternalAbort(llmAbort, options?.signal);
 
     try {
@@ -1004,7 +1009,7 @@ export async function sendLLMRequest(
         return applyOutputRegex(rawOutput, regexes, { macroEngine, activeTags });
     } catch (error: unknown) {
         if (error instanceof DOMException && (error as DOMException).name === "AbortError") {
-            throw new ChatEngineError("AI 回复超时（500秒），请重试。");
+            throw new ChatEngineError("AI 回复超时（20 分钟），请重试。");
         }
         if (error instanceof ChatEngineError) throw error;
         const detail = error instanceof Error ? error.message : String(error);
